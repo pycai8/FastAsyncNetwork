@@ -31,6 +31,134 @@ static uint64_t g_recvQueues[SKT_CNT] = {0};
 
 /*implement*/
 
+static void HandleEvents(int skt, uint32_t events, uint64_t queue, uint32_t targetEvents)
+{
+    if (!(events&targetEvents || events&EPOLLHUP || events&EPOLLERR))
+    {
+        LOG_ERROR("events[%u] error", events);
+        return;
+    }
+    
+    QueueData data = {0};
+    if (QueuePopFront(queue, &data) != 0)
+    {
+        LOG_ERROR("queue is empty for targetEvents[%u]", targetEvents);
+        return;
+    }
+    
+    pthread_mutex_t* mtx = ((data.type == SEND || data.type == SEND_TO) ? &g_binders[skt].sendMutex : &g_binders[skt].recvMutex);
+    int isCbLock = g_binders[skt].isCbLock;
+    switch(data.type)
+    {
+        case SEND:
+        case SEND_TO:
+        {
+            struct sockaddr* pAddr = (struct sockaddr*)(data.type == SEND ? 0 : &data.addr);
+            socklen_t addrLen = pAddr == 0 ? 0 : pAddr->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+            int ret = sendto(data.skt, data.buf+data.hdrLen, data.len-data.hdrLen, 0, pAddr, addrLen);
+            int err = errno;
+            if (ret > 0 || (ret == 0 && (err == EAGAIN || err == EWOULDBLOCK)))
+            {
+                data.hdrLen += ret;
+                if (data.hdrLen < data.len) // finish some part
+                {
+                    QueuePushFront(queue, &data);
+                    return;
+                }
+            }
+            else
+            {
+                data.retErr = (err != 0 ? err : ret); 
+            }
+            break;
+        }
+        case RECV:
+        case RECV_FROM:
+        {
+            struct sockaddr* pAddr = (struct sockaddr*)(data.type == RECV ? 0 : data.pAddr);
+            socklen_t addrLen = pAddr == 0 ? 0 : pAddr->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+            int ret = recvfrom(data.skt, data.buf, data.len, 0, pAddr, addrLen);
+            int err = errno;
+            if (ret > 0)
+            {
+                data.hdrLen = ret;
+            }
+            else
+            {
+                data.retErr = (err != 0 ? err : ret);
+            }
+        }
+        default:
+            break;
+    }
+    
+    // callback
+    if (isCbLock) LOCK(mtx);
+    if (g_binders[skt].useCount != data.useCount)
+    {
+        // may unregister, most time is bigger, when useCount over MAX_INT64 may smaller.
+    }
+    else
+    {
+        data.cb(data.retErr, data.hdrLen, data.usr);
+    }
+    if (isCbLock) UNLOCK(mtx);
+}
+
+static void* AsyncLoop(void* arg)
+{
+    int epfdIndex = (int)(unsigned long)arg;
+    int epollCount = g_config.sendEpollCount + g_config.recvEpollCount;
+    if (epfdIndex < 0 || epfdIndex >= epollCount)
+    {
+        LOG_ERROR("epfdIndex error");
+        return 0;
+    }
+    
+    int epfd = g_epfds[epfdIndex];
+    if (epfd < 0)
+    {
+        LOG_ERROR("epfd < 0");
+        return 0;
+    }
+    
+    int isSender = (epfdIndex < g_config.sendEpollCount ? 1 : 0);
+    
+    while (1)
+    {
+        struct epoll_event e = {0};
+        int ret = epoll_wait(ptr->epfd, &e, 1, g_config.epollWaitTime);
+        if (ret < 0)
+        {
+            int err = errno;
+            LOG_ERROR("epoll_wait failed, ret[%d], errno[%d], msg[%s]", ret, err, strerror(err));
+            break;
+        }
+        
+        if (ret == 0)
+        {
+            int err = errno;
+            LOG_DEBUG("epoll_wait may timeout, ret[0], errno[%d], msg[%s]", err, strerror(err));
+            continue;
+        }
+        
+        int skt = e.data.fd;
+        uint32_t events = e.events;
+        if (skt < 0 || skt >= SKT_CNT)
+        {
+            LOG_ERROR("skt from epoll is error");
+            continue;
+        }
+        
+        uint64_t queue = (isSender ? g_sendQueues[skt] : g_recvQueues[skt]);
+        uint32_t targetEvents = (isSender ? EPOLLOUT : EPOLLIN);
+        HandleEvents(skt, events, queue, targetEvents);
+    }
+    
+    free(ptr);
+    return 0;
+}
+
 static int SyncRecv(int type, int skt, char* buf, int len, FANAddr* addr, FANCallback cb, void* usr)
 {
     if ((type != RECV && type != RECV_FROM) || skt < 0 || skt >= SKT_CNT || buf == 0 || len <= 0 || addr == 0 || cb == 0 || usr == 0)
@@ -51,7 +179,6 @@ static int SyncRecv(int type, int skt, char* buf, int len, FANAddr* addr, FANCal
     uint64_t queue = g_recvQueues[skt];
     return QueuePushBack(queue, &data, 1);
 }
-
 static int SyncSend(int type, int skt, char* buf, int len, FANAddr* addr, FANCallback cb, void* usr)
 {    
     if ((type != SEND && type != SEND_TO) || skt < 0 || skt >= SKT_CNT || buf == 0 || len <= 0 || cb == 0 || usr == 0)
